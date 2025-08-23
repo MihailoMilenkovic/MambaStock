@@ -5,7 +5,7 @@ from sklearn.metrics import mean_squared_error,mean_absolute_error,r2_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba import Mamba, MambaConfig
+from mamba import Model, MambaConfig
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -25,7 +25,10 @@ parser.add_argument('--layer', type=int, default=2,
 parser.add_argument('--n-test', type=int, default=300,
                     help='Size of test set')
 parser.add_argument('--ts-code', type=str, default='601988',
-                    help='Stock code')                    
+                    help='Stock code')
+parser.add_argument('--model_type', type=str, default='mamba', 
+                    choices=['mamba', 'lstm', 'transformer'],
+                    help='Model type: mamba, lstm, or transformer')
 
 args = parser.parse_args()
 args.cuda = args.use_cuda and torch.cuda.is_available()
@@ -55,16 +58,17 @@ set_seed(args.seed,args.cuda)
 class Net(nn.Module):
     def __init__(self,in_dim,out_dim):
         super().__init__()
-        self.config = MambaConfig(d_model=args.hidden, n_layers=args.layer)
-        self.mamba = nn.Sequential(
+        
+        self.config = MambaConfig(d_model=args.hidden, n_layers=args.layer, model_type=args.model_type)
+        self.model = nn.Sequential(
             nn.Linear(in_dim,args.hidden),
-            Mamba(self.config),
+            Model(self.config),
             nn.Linear(args.hidden,out_dim),
             nn.Tanh()
         )
     
     def forward(self,x):
-        x = self.mamba(x)
+        x = self.model(x)
         return x.flatten()
 
 def PredictWithData(trainX, trainy, testX):

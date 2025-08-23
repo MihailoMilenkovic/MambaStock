@@ -31,6 +31,7 @@ See Figure 3 of the paper (page 8) for a visual representation of a MambaBlock.
 class MambaConfig:
     d_model: int # D
     n_layers: int
+    model_type: str = 'mamba'  # 'mamba', 'lstm', or 'transformer'
     dt_rank: Union[int, str] = 'auto'
     d_state: int = 16 # N in paper/comments
     expand_factor: int = 2 # E in paper/comments
@@ -53,7 +54,37 @@ class MambaConfig:
         if self.dt_rank == 'auto':
             self.dt_rank = math.ceil(self.d_model / 16)
 
-class Mamba(nn.Module):
+class LSTMBlock(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.lstm = nn.LSTM(config.d_model, config.d_model, config.n_layers, batch_first=True)
+        
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return out
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        encoder_layer = nn.TransformerEncoderLayer(config.d_model, nhead=8, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, config.n_layers)
+        
+    def forward(self, x):
+        return self.transformer(x)
+
+def create_sequence_block(config: MambaConfig):
+    if config.model_type == 'mamba':
+        return MambaBlock(config)
+    elif config.model_type == 'lstm':
+        return LSTMBlock(config)
+    elif config.model_type == 'transformer':
+        return TransformerBlock(config)
+    else:
+        raise ValueError(f"Unsupported model_type: {config.model_type}")
+
+class Model(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
 
@@ -90,7 +121,7 @@ class ResidualBlock(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
 
-        self.mixer = MambaBlock(config)
+        self.mixer = create_sequence_block(config)
         self.norm = RMSNorm(config.d_model)
 
     def forward(self, x):
@@ -110,7 +141,11 @@ class ResidualBlock(nn.Module):
         # output : (B, D)
         # cache : (h, inputs)
 
-        output, cache = self.mixer.step(self.norm(x), cache)
+        if hasattr(self.mixer, 'step'):
+            output, cache = self.mixer.step(self.norm(x), cache)
+        else:
+            # For LSTM and Transformer blocks, just use forward pass
+            output = self.mixer(self.norm(x.unsqueeze(0))).squeeze(0)
         output = output + x
         return output, cache
 
