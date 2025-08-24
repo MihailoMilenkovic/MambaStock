@@ -97,7 +97,7 @@ def PredictWithData(trainX, trainy, testX):
     mat = clf(xv)
     if args.cuda: mat = mat.cpu()
     yhat = mat.detach().numpy().flatten()
-    return yhat
+    return yhat, clf
 
 data = pd.read_csv(args.ts_code+'.SH.csv')
 data['trade_date'] = pd.to_datetime(data['trade_date'], format='%Y%m%d')
@@ -107,7 +107,7 @@ data.drop(columns=['pre_close','change','pct_chg'],inplace=True)
 dat = data.iloc[:,2:].values
 trainX, testX = dat[:-args.n_test, :], dat[-args.n_test:, :]
 trainy = ratechg[:-args.n_test]
-predictions = PredictWithData(trainX, trainy, testX)
+predictions, model = PredictWithData(trainX, trainy, testX)
 time = data['trade_date'][-args.n_test:]
 data1 = close[-args.n_test:]
 finalpredicted_stock_price = []
@@ -119,6 +119,21 @@ for i in range(args.n_test):
 dateinf(data['trade_date'],args.n_test)
 print('MSE RMSE MAE R2')
 evaluation_metric(data1, finalpredicted_stock_price)
+
+# Save model
+model_save_path = f'model_{args.model_type}_{args.ts_code}.pth'
+model_info = {
+    'state_dict': model.state_dict(),
+    'config': {
+        'model_type': args.model_type,
+        'hidden': args.hidden,
+        'layer': args.layer,
+        'input_dim': len(trainX[0])
+    },
+    'args': vars(args)
+}
+torch.save(model_info, model_save_path)
+print(f'Model saved to {model_save_path}')
 plt.figure(figsize=(10, 6))
 plt.plot(time, data1, label='Stock Price')
 plt.plot(time, finalpredicted_stock_price, label='Predicted Stock Price')
