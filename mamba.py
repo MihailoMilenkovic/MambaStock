@@ -69,12 +69,22 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
         self.config = config
-        # Use configurable number of heads; default is 1
-        encoder_layer = nn.TransformerEncoderLayer(config.d_model, nhead=config.n_heads, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, config.n_layers)
-        
+        # Decoder-only stack with causal self-attention
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.d_model,
+            nhead=config.n_heads,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, config.n_layers)
+
     def forward(self, x):
-        return self.transformer(x)
+        # x: (B, L, D)
+        B, L, D = x.shape
+        # Causal mask for autoregressive decoding (allow attend to <= current position)
+        tgt_mask = torch.triu(torch.full((L, L), float('-inf'), device=x.device), diagonal=1)
+        # Minimal memory to satisfy API; no encoder context in decoder-only models
+        memory = torch.zeros(B, 1, D, device=x.device, dtype=x.dtype)
+        return self.decoder(x, memory, tgt_mask=tgt_mask)
 
 def create_sequence_block(config: MambaConfig):
     if config.model_type == 'mamba':
