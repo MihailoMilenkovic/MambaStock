@@ -32,6 +32,7 @@ class MambaConfig:
     d_model: int # D
     n_layers: int
     model_type: str = 'mamba'  # 'mamba', 'lstm', or 'transformer'
+    n_heads: int = 1  # number of attention heads for transformer
     dt_rank: Union[int, str] = 'auto'
     d_state: int = 16 # N in paper/comments
     expand_factor: int = 2 # E in paper/comments
@@ -68,7 +69,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
         self.config = config
-        encoder_layer = nn.TransformerEncoderLayer(config.d_model, nhead=8, batch_first=True)
+        # Use configurable number of heads; default is 1
+        encoder_layer = nn.TransformerEncoderLayer(config.d_model, nhead=config.n_heads, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, config.n_layers)
         
     def forward(self, x):

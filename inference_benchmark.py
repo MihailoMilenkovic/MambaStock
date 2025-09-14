@@ -205,7 +205,7 @@ def main():
     parser.add_argument('--num-runs', type=int, default=100, help='Number of runs for each benchmark')
     parser.add_argument('--backend', type=str, choices=['pytorch', 'onnx'], default='pytorch',
                         help='Inference backend to use')
-    parser.add_argument('--seq-len', type=int, default=20, help='Sequence length for inputs')
+    parser.add_argument('--seq-len', type=int, default=20, help='Sequence length for inputs (default 20)')
     parser.add_argument('--vary-sl', action='store_true', help='Vary sequence length instead of batch size')
     parser.add_argument('--onnx-dir', type=str, default='onnx_models', help='Directory with ONNX models')
     
@@ -252,7 +252,7 @@ def main():
             if args.backend == 'pytorch':
                 model, config = load_model(model_path, device)
                 if args.vary_sl:
-                    seq_lens = [20, 100, 500, 2500]
+                    seq_lens = [20, 100, 500, 2500, 12500]
                     fixed_batch = args.batch_sizes[0]
                     latencies = benchmark_model_pytorch_by_seq(
                         model,
@@ -286,7 +286,7 @@ def main():
                 if input_dim is None:
                     input_dim = 15  # Fallback common default in this repo
                 if args.vary_sl:
-                    seq_lens = [20, 100, 500, 2500]
+                    seq_lens = [20, 100, 500, 2500, 12500]
                     fixed_batch = args.batch_sizes[0]
                     latencies = benchmark_model_onnx_by_seq(
                         session,
