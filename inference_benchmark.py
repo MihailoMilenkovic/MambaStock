@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 from mamba import Model, MambaConfig
+import onnxruntime as ort
+from pathlib import Path
 
 class Net(nn.Module):
     def __init__(self, config, in_dim, out_dim):
@@ -43,15 +45,12 @@ def load_model(model_path, device):
     
     return model, config
 
-def benchmark_model(model, batch_sizes, input_dim, device, num_runs=100):
-    """Benchmark model inference for different batch sizes"""
+def benchmark_model_pytorch(model, batch_sizes, input_dim, device, num_runs=100, seq_len=20):
+    """Benchmark PyTorch model inference for different batch sizes"""
     latencies = {}
-    
     # Use a small sequence length for benchmarking to avoid timeout
-    seq_len = 20  # This simulates a reasonable sequence length
-    
     for batch_size in batch_sizes:
-        print(f"Benchmarking batch size {batch_size}...")
+        print(f"Benchmarking batch size {batch_size} (PyTorch)...")
         
         # Generate random input: (batch_size, seq_len, input_dim)  
         x = torch.randn(batch_size, seq_len, input_dim, device=device)
@@ -86,24 +85,77 @@ def benchmark_model(model, batch_sizes, input_dim, device, num_runs=100):
     
     return latencies
 
+def load_onnx_model_ort(model_path):
+    """Load ONNX model with ONNX Runtime, prefer GPU if available, and infer input_dim."""
+    available = ort.get_available_providers()
+    if 'CUDAExecutionProvider' in available:
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        used_provider = 'CUDAExecutionProvider'
+    else:
+        providers = ['CPUExecutionProvider']
+        used_provider = 'CPUExecutionProvider'
+    session = ort.InferenceSession(str(model_path), providers=providers)
+    inp = session.get_inputs()[0]
+    shape = inp.shape
+    input_dim = shape[-1] if isinstance(shape[-1], int) else None
+    return session, input_dim, used_provider
+
+def benchmark_model_onnx(session, batch_sizes, input_dim, num_runs=100, seq_len=20):
+    """Benchmark ONNX model inference for different batch sizes on CPU."""
+    latencies = {}
+    input_name = session.get_inputs()[0].name
+    for batch_size in batch_sizes:
+        print(f"Benchmarking batch size {batch_size} (ONNX)...")
+        x = np.random.randn(batch_size, seq_len, input_dim).astype(np.float32)
+        # Warmup
+        for _ in range(3):
+            _ = session.run(None, {input_name: x})
+        # Benchmark
+        times = []
+        for _ in range(num_runs):
+            start_time = time.perf_counter()
+            _ = session.run(None, {input_name: x})
+            end_time = time.perf_counter()
+            times.append((end_time - start_time) * 1000)
+        latencies[batch_size] = {
+            'mean': np.mean(times),
+            'std': np.std(times),
+            'min': np.min(times),
+            'max': np.max(times),
+        }
+    return latencies
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--use-cuda', action='store_true', help='Use CUDA if available')
+    parser.add_argument('--use-cuda', action='store_true', help='[Deprecated] CUDA auto-detected; flag ignored')
     parser.add_argument('--ts-code', type=str, default='601988', help='Stock code')
     parser.add_argument('--batch-sizes', nargs='+', type=int, default=[1, 4, 8, 16, 32], 
                         help='Batch sizes to benchmark')
     parser.add_argument('--num-runs', type=int, default=100, help='Number of runs for each benchmark')
+    parser.add_argument('--backend', type=str, choices=['pytorch', 'onnx'], default='pytorch',
+                        help='Inference backend to use')
+    parser.add_argument('--seq-len', type=int, default=20, help='Sequence length for inputs')
+    parser.add_argument('--onnx-dir', type=str, default='onnx_models', help='Directory with ONNX models')
     
     args = parser.parse_args()
     
-    device = torch.device('cuda' if args.use_cuda and torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Auto-select device: use CUDA if available, else CPU (PyTorch). ONNX uses CUDA EP if available.
+    device = torch.device('cuda' if args.backend == 'pytorch' and torch.cuda.is_available() else 'cpu')
+    if args.backend == 'pytorch':
+        print(f"Using device: {device}")
     
     model_types = ['mamba', 'lstm', 'transformer']
-    model_paths = {
-        model_type: f'model_{model_type}_{args.ts_code}.pth' 
-        for model_type in model_types
-    }
+    if args.backend == 'pytorch':
+        model_paths = {
+            model_type: f'model_{model_type}_{args.ts_code}.pth' 
+            for model_type in model_types
+        }
+    else:
+        onnx_dir = Path(args.onnx_dir)
+        model_paths = {
+            model_type: str(onnx_dir / f"{model_type}_{args.ts_code}.onnx")
+            for model_type in model_types
+        }
     
     # Check which models exist
     available_models = {}
@@ -121,20 +173,49 @@ def main():
     # Benchmark each model
     results = {}
     
+    onnx_used_provider = None
     for model_type, model_path in available_models.items():
         print(f"\nBenchmarking {model_type.upper()} model...")
-        
         try:
-            model, config = load_model(model_path, device)
-            latencies = benchmark_model(model, args.batch_sizes, config['input_dim'], device, args.num_runs)
+            if args.backend == 'pytorch':
+                model, config = load_model(model_path, device)
+                latencies = benchmark_model_pytorch(
+                    model,
+                    args.batch_sizes,
+                    config['input_dim'],
+                    device,
+                    args.num_runs,
+                    seq_len=args.seq_len,
+                )
+            else:
+                session, input_dim, provider = load_onnx_model_ort(model_path)
+                onnx_used_provider = provider
+                if input_dim is None:
+                    # Attempt to read input_dim from corresponding checkpoint if available
+                    ckpt_path = f'model_{model_type}_{args.ts_code}.pth'
+                    if os.path.exists(ckpt_path):
+                        try:
+                            _, cfg = load_model(ckpt_path, torch.device('cpu'))
+                            input_dim = cfg['input_dim']
+                        except Exception:
+                            pass
+                if input_dim is None:
+                    input_dim = 15  # Fallback common default in this repo
+                latencies = benchmark_model_onnx(
+                    session,
+                    args.batch_sizes,
+                    input_dim,
+                    args.num_runs,
+                    seq_len=args.seq_len,
+                )
             results[model_type] = latencies
-            
             # Print results
             print(f"\n{model_type.upper()} Results:")
             for batch_size, stats in latencies.items():
-                print(f"  Batch {batch_size:2d}: {stats['mean']:6.2f}ms ± {stats['std']:5.2f}ms "
-                      f"(min: {stats['min']:5.2f}ms, max: {stats['max']:6.2f}ms)")
-                
+                print(
+                    f"  Batch {batch_size:2d}: {stats['mean']:6.2f}ms ± {stats['std']:5.2f}ms "
+                    f"(min: {stats['min']:5.2f}ms, max: {stats['max']:6.2f}ms)"
+                )
         except Exception as e:
             print(f"Error benchmarking {model_type}: {e}")
             continue
@@ -143,6 +224,13 @@ def main():
     if len(results) > 1:
         print("\nCreating comparison plots...")
         
+        # Add a figure-level title with backend and device/provider
+        if args.backend == 'pytorch':
+            run_label = f"Backend: PyTorch | Device: {device}"
+        else:
+            dev_label = 'cuda' if (onnx_used_provider and 'CUDA' in onnx_used_provider) else 'cpu'
+            run_label = f"Backend: ONNX | Provider: {onnx_used_provider or 'CPUExecutionProvider'} | Device: {dev_label}"
+
         # Plot 1: Mean latency vs batch size
         plt.figure(figsize=(12, 8))
         
@@ -213,7 +301,8 @@ def main():
             plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std_latencies[mean_latencies.index(mean_lat)],
                      f'{mean_lat:.1f}ms', ha='center', va='bottom')
         
-        plt.tight_layout()
+        plt.suptitle(run_label)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(f'inference_benchmark_{args.ts_code}.png', dpi=300, bbox_inches='tight')
         plt.show()
         
@@ -225,7 +314,11 @@ def main():
     with open(results_file, 'w') as f:
         json.dump({
             'args': vars(args),
-            'device': str(device),
+            'backend': args.backend,
+            'device': str(device) if args.backend == 'pytorch' else (
+                'cuda' if (onnx_used_provider and 'CUDA' in onnx_used_provider) else 'cpu'
+            ),
+            'onnx_provider': onnx_used_provider,
             'results': results
         }, f, indent=2)
     
