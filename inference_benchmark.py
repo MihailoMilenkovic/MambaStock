@@ -85,6 +85,45 @@ def benchmark_model_pytorch(model, batch_sizes, input_dim, device, num_runs=100,
     
     return latencies
 
+def benchmark_model_pytorch_by_seq(model, seq_lens, input_dim, device, num_runs=100, batch_size=1):
+    """Benchmark PyTorch model inference for different sequence lengths.
+
+    Uses a fixed batch size and sweeps sequence lengths.
+    Returns a dict keyed by sequence length with latency stats.
+    """
+    latencies = {}
+    for sl in seq_lens:
+        print(f"Benchmarking sequence length {sl} (PyTorch)...")
+
+        x = torch.randn(batch_size, sl, input_dim, device=device)
+
+        # Warmup
+        for _ in range(3):
+            with torch.no_grad():
+                _ = model(x)
+
+        # Benchmark
+        times = []
+        for _ in range(num_runs):
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            start_time = time.perf_counter()
+            with torch.no_grad():
+                _ = model(x)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            times.append((end_time - start_time) * 1000)
+
+        latencies[sl] = {
+            'mean': np.mean(times),
+            'std': np.std(times),
+            'min': np.min(times),
+            'max': np.max(times)
+        }
+
+    return latencies
+
 def load_onnx_model_ort(model_path):
     """Load ONNX model with ONNX Runtime, prefer GPU if available, and infer input_dim."""
     available = ort.get_available_providers()
@@ -125,6 +164,38 @@ def benchmark_model_onnx(session, batch_sizes, input_dim, num_runs=100, seq_len=
         }
     return latencies
 
+def benchmark_model_onnx_by_seq(session, seq_lens, input_dim, num_runs=100, batch_size=1):
+    """Benchmark ONNX model inference for different sequence lengths.
+
+    Uses a fixed batch size and sweeps sequence lengths.
+    Returns a dict keyed by sequence length with latency stats.
+    """
+    latencies = {}
+    input_name = session.get_inputs()[0].name
+    for sl in seq_lens:
+        print(f"Benchmarking sequence length {sl} (ONNX)...")
+        x = np.random.randn(batch_size, sl, input_dim).astype(np.float32)
+
+        # Warmup
+        for _ in range(3):
+            _ = session.run(None, {input_name: x})
+
+        # Benchmark
+        times = []
+        for _ in range(num_runs):
+            start_time = time.perf_counter()
+            _ = session.run(None, {input_name: x})
+            end_time = time.perf_counter()
+            times.append((end_time - start_time) * 1000)
+
+        latencies[sl] = {
+            'mean': np.mean(times),
+            'std': np.std(times),
+            'min': np.min(times),
+            'max': np.max(times),
+        }
+    return latencies
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--use-cuda', action='store_true', help='[Deprecated] CUDA auto-detected; flag ignored')
@@ -135,6 +206,7 @@ def main():
     parser.add_argument('--backend', type=str, choices=['pytorch', 'onnx'], default='pytorch',
                         help='Inference backend to use')
     parser.add_argument('--seq-len', type=int, default=20, help='Sequence length for inputs')
+    parser.add_argument('--vary-sl', action='store_true', help='Vary sequence length instead of batch size')
     parser.add_argument('--onnx-dir', type=str, default='onnx_models', help='Directory with ONNX models')
     
     args = parser.parse_args()
@@ -179,14 +251,26 @@ def main():
         try:
             if args.backend == 'pytorch':
                 model, config = load_model(model_path, device)
-                latencies = benchmark_model_pytorch(
-                    model,
-                    args.batch_sizes,
-                    config['input_dim'],
-                    device,
-                    args.num_runs,
-                    seq_len=args.seq_len,
-                )
+                if args.vary_sl:
+                    seq_lens = [20, 100, 500, 2500]
+                    fixed_batch = args.batch_sizes[0]
+                    latencies = benchmark_model_pytorch_by_seq(
+                        model,
+                        seq_lens,
+                        config['input_dim'],
+                        device,
+                        args.num_runs,
+                        batch_size=fixed_batch,
+                    )
+                else:
+                    latencies = benchmark_model_pytorch(
+                        model,
+                        args.batch_sizes,
+                        config['input_dim'],
+                        device,
+                        args.num_runs,
+                        seq_len=args.seq_len,
+                    )
             else:
                 session, input_dim, provider = load_onnx_model_ort(model_path)
                 onnx_used_provider = provider
@@ -201,21 +285,39 @@ def main():
                             pass
                 if input_dim is None:
                     input_dim = 15  # Fallback common default in this repo
-                latencies = benchmark_model_onnx(
-                    session,
-                    args.batch_sizes,
-                    input_dim,
-                    args.num_runs,
-                    seq_len=args.seq_len,
-                )
+                if args.vary_sl:
+                    seq_lens = [20, 100, 500, 2500]
+                    fixed_batch = args.batch_sizes[0]
+                    latencies = benchmark_model_onnx_by_seq(
+                        session,
+                        seq_lens,
+                        input_dim,
+                        args.num_runs,
+                        batch_size=fixed_batch,
+                    )
+                else:
+                    latencies = benchmark_model_onnx(
+                        session,
+                        args.batch_sizes,
+                        input_dim,
+                        args.num_runs,
+                        seq_len=args.seq_len,
+                    )
             results[model_type] = latencies
             # Print results
             print(f"\n{model_type.upper()} Results:")
-            for batch_size, stats in latencies.items():
-                print(
-                    f"  Batch {batch_size:2d}: {stats['mean']:6.2f}ms ± {stats['std']:5.2f}ms "
-                    f"(min: {stats['min']:5.2f}ms, max: {stats['max']:6.2f}ms)"
-                )
+            if args.vary_sl:
+                for sl, stats in latencies.items():
+                    print(
+                        f"  SeqLen {sl:5d}: {stats['mean']:6.2f}ms ± {stats['std']:5.2f}ms "
+                        f"(min: {stats['min']:5.2f}ms, max: {stats['max']:6.2f}ms)"
+                    )
+            else:
+                for batch_size, stats in latencies.items():
+                    print(
+                        f"  Batch {batch_size:2d}: {stats['mean']:6.2f}ms ± {stats['std']:5.2f}ms "
+                        f"(min: {stats['min']:5.2f}ms, max: {stats['max']:6.2f}ms)"
+                    )
         except Exception as e:
             print(f"Error benchmarking {model_type}: {e}")
             continue
@@ -231,82 +333,142 @@ def main():
             dev_label = 'cuda' if (onnx_used_provider and 'CUDA' in onnx_used_provider) else 'cpu'
             run_label = f"Backend: ONNX | Provider: {onnx_used_provider or 'CPUExecutionProvider'} | Device: {dev_label}"
 
-        # Plot 1: Mean latency vs batch size
+        # Plot 1-4 depending on whether we vary sequence length or batch size
         plt.figure(figsize=(12, 8))
-        
-        plt.subplot(2, 2, 1)
-        for model_type, latencies in results.items():
-            batch_sizes = list(latencies.keys())
-            means = [latencies[bs]['mean'] for bs in batch_sizes]
-            stds = [latencies[bs]['std'] for bs in batch_sizes]
-            
-            plt.errorbar(batch_sizes, means, yerr=stds, marker='o', label=model_type.upper(), capsize=5)
-        
-        plt.xlabel('Batch Size')
-        plt.ylabel('Latency (ms)')
-        plt.title('Mean Inference Latency vs Batch Size')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.yscale('log')
-        
-        # Plot 2: Throughput (samples/sec)
-        plt.subplot(2, 2, 2)
-        for model_type, latencies in results.items():
-            batch_sizes = list(latencies.keys())
-            throughputs = [bs / (latencies[bs]['mean'] / 1000) for bs in batch_sizes]  # samples/sec
-            
-            plt.plot(batch_sizes, throughputs, marker='s', label=model_type.upper())
-        
-        plt.xlabel('Batch Size')
-        plt.ylabel('Throughput (samples/sec)')
-        plt.title('Inference Throughput vs Batch Size')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # Plot 3: Latency per sample
-        plt.subplot(2, 2, 3)
-        for model_type, latencies in results.items():
-            batch_sizes = list(latencies.keys())
-            latency_per_sample = [latencies[bs]['mean'] / bs for bs in batch_sizes]
-            
-            plt.plot(batch_sizes, latency_per_sample, marker='^', label=model_type.upper())
-        
-        plt.xlabel('Batch Size')
-        plt.ylabel('Latency per Sample (ms)')
-        plt.title('Latency per Sample vs Batch Size')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        # Plot 4: Model comparison at specific batch size
-        plt.subplot(2, 2, 4)
-        comparison_batch_size = 16 if 16 in args.batch_sizes else args.batch_sizes[0]
-        
-        model_names = []
-        mean_latencies = []
-        std_latencies = []
-        
-        for model_type, latencies in results.items():
-            if comparison_batch_size in latencies:
-                model_names.append(model_type.upper())
-                mean_latencies.append(latencies[comparison_batch_size]['mean'])
-                std_latencies.append(latencies[comparison_batch_size]['std'])
-        
-        bars = plt.bar(model_names, mean_latencies, yerr=std_latencies, capsize=5, alpha=0.7)
-        plt.ylabel('Latency (ms)')
-        plt.title(f'Model Comparison (Batch Size = {comparison_batch_size})')
-        plt.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for bar, mean_lat in zip(bars, mean_latencies):
-            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std_latencies[mean_latencies.index(mean_lat)],
-                     f'{mean_lat:.1f}ms', ha='center', va='bottom')
+
+        if args.vary_sl:
+            # Plot 1: Mean latency vs sequence length
+            plt.subplot(2, 2, 1)
+            for model_type, latencies in results.items():
+                seq_lens = list(latencies.keys())
+                means = [latencies[sl]['mean'] for sl in seq_lens]
+                stds = [latencies[sl]['std'] for sl in seq_lens]
+                plt.errorbar(seq_lens, means, yerr=stds, marker='o', label=model_type.upper(), capsize=5)
+
+            plt.xlabel('Sequence Length')
+            plt.ylabel('Latency (ms)')
+            plt.title('Mean Inference Latency vs Sequence Length')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.yscale('log')
+
+            # Plot 2: Throughput (samples/sec) at fixed batch size
+            plt.subplot(2, 2, 2)
+            fixed_batch = args.batch_sizes[0]
+            for model_type, latencies in results.items():
+                seq_lens = list(latencies.keys())
+                throughputs = [fixed_batch / (latencies[sl]['mean'] / 1000) for sl in seq_lens]
+                plt.plot(seq_lens, throughputs, marker='s', label=model_type.upper())
+
+            plt.xlabel('Sequence Length')
+            plt.ylabel('Throughput (samples/sec)')
+            plt.title(f'Inference Throughput vs Sequence Length (Batch={fixed_batch})')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+
+            # Plot 3: Latency per sample
+            plt.subplot(2, 2, 3)
+            for model_type, latencies in results.items():
+                seq_lens = list(latencies.keys())
+                latency_per_sample = [latencies[sl]['mean'] / args.batch_sizes[0] for sl in seq_lens]
+                plt.plot(seq_lens, latency_per_sample, marker='^', label=model_type.upper())
+
+            plt.xlabel('Sequence Length')
+            plt.ylabel('Latency per Sample (ms)')
+            plt.title(f'Latency per Sample vs Sequence Length (Batch={args.batch_sizes[0]})')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+
+            # Plot 4: Model comparison at specific sequence length
+            plt.subplot(2, 2, 4)
+            seq_lens_all = list(next(iter(results.values())).keys())
+            comparison_seq_len = 500 if 500 in seq_lens_all else seq_lens_all[0]
+
+            model_names = []
+            mean_latencies = []
+            std_latencies = []
+            for model_type, latencies in results.items():
+                if comparison_seq_len in latencies:
+                    model_names.append(model_type.upper())
+                    mean_latencies.append(latencies[comparison_seq_len]['mean'])
+                    std_latencies.append(latencies[comparison_seq_len]['std'])
+
+            bars = plt.bar(model_names, mean_latencies, yerr=std_latencies, capsize=5, alpha=0.7)
+            plt.ylabel('Latency (ms)')
+            plt.title(f'Model Comparison (Seq Len = {comparison_seq_len})')
+            plt.grid(True, alpha=0.3, axis='y')
+
+            for bar, mean_lat, std_lat in zip(bars, mean_latencies, std_latencies):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std_lat,
+                         f'{mean_lat:.1f}ms', ha='center', va='bottom')
+        else:
+            # Original batch-size plots
+            plt.subplot(2, 2, 1)
+            for model_type, latencies in results.items():
+                batch_sizes = list(latencies.keys())
+                means = [latencies[bs]['mean'] for bs in batch_sizes]
+                stds = [latencies[bs]['std'] for bs in batch_sizes]
+                plt.errorbar(batch_sizes, means, yerr=stds, marker='o', label=model_type.upper(), capsize=5)
+
+            plt.xlabel('Batch Size')
+            plt.ylabel('Latency (ms)')
+            plt.title('Mean Inference Latency vs Batch Size')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.yscale('log')
+
+            plt.subplot(2, 2, 2)
+            for model_type, latencies in results.items():
+                batch_sizes = list(latencies.keys())
+                throughputs = [bs / (latencies[bs]['mean'] / 1000) for bs in batch_sizes]
+                plt.plot(batch_sizes, throughputs, marker='s', label=model_type.upper())
+
+            plt.xlabel('Batch Size')
+            plt.ylabel('Throughput (samples/sec)')
+            plt.title('Inference Throughput vs Batch Size')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+
+            plt.subplot(2, 2, 3)
+            for model_type, latencies in results.items():
+                batch_sizes = list(latencies.keys())
+                latency_per_sample = [latencies[bs]['mean'] / bs for bs in batch_sizes]
+                plt.plot(batch_sizes, latency_per_sample, marker='^', label=model_type.upper())
+
+            plt.xlabel('Batch Size')
+            plt.ylabel('Latency per Sample (ms)')
+            plt.title('Latency per Sample vs Batch Size')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+
+            plt.subplot(2, 2, 4)
+            comparison_batch_size = 16 if 16 in args.batch_sizes else args.batch_sizes[0]
+
+            model_names = []
+            mean_latencies = []
+            std_latencies = []
+            for model_type, latencies in results.items():
+                if comparison_batch_size in latencies:
+                    model_names.append(model_type.upper())
+                    mean_latencies.append(latencies[comparison_batch_size]['mean'])
+                    std_latencies.append(latencies[comparison_batch_size]['std'])
+
+            bars = plt.bar(model_names, mean_latencies, yerr=std_latencies, capsize=5, alpha=0.7)
+            plt.ylabel('Latency (ms)')
+            plt.title(f'Model Comparison (Batch Size = {comparison_batch_size})')
+            plt.grid(True, alpha=0.3, axis='y')
+
+            for bar, mean_lat, std_lat in zip(bars, mean_latencies, std_latencies):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std_lat,
+                         f'{mean_lat:.1f}ms', ha='center', va='bottom')
         
         plt.suptitle(run_label)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(f'inference_benchmark_{args.ts_code}.png', dpi=300, bbox_inches='tight')
+        out_suffix = 'seq' if args.vary_sl else 'batch'
+        plt.savefig(f'inference_benchmark_{args.ts_code}_{out_suffix}.png', dpi=300, bbox_inches='tight')
         plt.show()
         
-        print(f"Benchmark plots saved as inference_benchmark_{args.ts_code}.png")
+        print(f"Benchmark plots saved as inference_benchmark_{args.ts_code}_{out_suffix}.png")
     
     # Save benchmark results
     import json
