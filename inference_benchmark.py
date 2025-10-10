@@ -25,6 +25,41 @@ class Net(nn.Module):
         x = self.model(x)
         return x.flatten()
 
+    def init_caches(self, batch_size, device):
+        """Initialize decode caches per layer based on model type."""
+        seq_model: Model = self.model[1]
+        cfg = seq_model.config
+        n_layers = cfg.n_layers
+        if cfg.model_type == 'mamba':
+            # (h=None, inputs=zeros)
+            ED = cfg.d_inner
+            inputs = torch.zeros(batch_size, ED, cfg.d_conv - 1, device=device)
+            return [(None, inputs.clone()) for _ in range(n_layers)]
+        elif cfg.model_type == 'lstm':
+            # (h, c) per block (each block contains an LSTM with cfg.n_layers stacked)
+            D = cfg.d_model
+            h0 = torch.zeros(cfg.n_layers, batch_size, D, device=device)
+            c0 = torch.zeros(cfg.n_layers, batch_size, D, device=device)
+            return [(h0.clone(), c0.clone()) for _ in range(n_layers)]
+        elif cfg.model_type == 'transformer':
+            # Keep prior normalized inputs per layer as a small window (initialized empty)
+            D = cfg.d_model
+            empty = torch.zeros(batch_size, 0, D, device=device)
+            return [empty.clone() for _ in range(n_layers)]
+        else:
+            return [None for _ in range(n_layers)]
+
+    def step(self, x_t, caches):
+        """Single-token decode step.
+        x_t: (B, input_dim). caches: list per layer. Returns (B,), updated caches.
+        """
+        # Project in, run sequence model step, project out
+        x_proj = self.model[0](x_t)
+        x_mid, caches = self.model[1].step(x_proj, caches)
+        x_out = self.model[2](x_mid)
+        x_out = self.model[3](x_out)
+        return x_out.flatten(), caches
+
 def load_model(model_path, device):
     """Load a trained model from checkpoint"""
     checkpoint = torch.load(model_path, map_location=device)
@@ -83,6 +118,52 @@ def benchmark_model_pytorch(model, batch_sizes, input_dim, device, num_runs=100,
             'max': np.max(times)
         }
     
+    return latencies
+
+def benchmark_model_pytorch_decode(model, batch_sizes, input_dim, device, num_runs=100, kv_cache_len=64):
+    """Benchmark PyTorch model in decode mode (1 token) for different batch sizes.
+
+    - Mamba/LSTM: use model.step with per-layer caches.
+    - Transformer: use sliding-window cache of size `kv_cache_len` inside each block.
+    """
+    latencies = {}
+    seq_model: Model = model.model[1]
+    # Ensure transformer step uses the requested cache window
+    if hasattr(seq_model.config, 'kv_cache_len'):
+        seq_model.config.kv_cache_len = int(kv_cache_len)
+    for batch_size in batch_sizes:
+        print(f"Benchmarking batch size {batch_size} (PyTorch Decode)...")
+        # Initialize caches
+        caches = model.init_caches(batch_size, device)
+
+        # Warm up: prefill caches to the window size for transformer and to steady-state for others
+        prefill_steps = int(kv_cache_len)
+        with torch.no_grad():
+            for _ in range(prefill_steps):
+                x_t = torch.randn(batch_size, input_dim, device=device)
+                _, caches = model.step(x_t, caches)
+
+        # Benchmark single-token decode steps
+        times = []
+        with torch.no_grad():
+            for _ in range(num_runs):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                start_time = time.perf_counter()
+                x_t = torch.randn(batch_size, input_dim, device=device)
+                _, caches = model.step(x_t, caches)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                end_time = time.perf_counter()
+                times.append((end_time - start_time) * 1000)
+
+        latencies[batch_size] = {
+            'mean': np.mean(times),
+            'std': np.std(times),
+            'min': np.min(times),
+            'max': np.max(times)
+        }
+
     return latencies
 
 def benchmark_model_pytorch_by_seq(model, seq_lens, input_dim, device, num_runs=100, batch_size=1):
@@ -208,6 +289,7 @@ def main():
     parser.add_argument('--seq-len', type=int, default=20, help='Sequence length for inputs (default 20)')
     parser.add_argument('--vary-sl', action='store_true', help='Vary sequence length instead of batch size')
     parser.add_argument('--onnx-dir', type=str, default='onnx_models', help='Directory with ONNX models')
+    parser.add_argument('--decode-cache-len', type=int, default=64, help='Decode-mode cache/window length for transformer')
     
     args = parser.parse_args()
     
@@ -263,13 +345,14 @@ def main():
                         batch_size=fixed_batch,
                     )
                 else:
-                    latencies = benchmark_model_pytorch(
+                    # Decode mode for batch benchmark: 1 token with cache
+                    latencies = benchmark_model_pytorch_decode(
                         model,
                         args.batch_sizes,
                         config['input_dim'],
                         device,
                         args.num_runs,
-                        seq_len=args.seq_len,
+                        kv_cache_len=args.decode_cache_len,
                     )
             else:
                 session, input_dim, provider = load_onnx_model_ort(model_path)
@@ -296,12 +379,13 @@ def main():
                         batch_size=fixed_batch,
                     )
                 else:
+                    # Approximate decode mode for ONNX with seq_len=1
                     latencies = benchmark_model_onnx(
                         session,
                         args.batch_sizes,
                         input_dim,
                         args.num_runs,
-                        seq_len=args.seq_len,
+                        seq_len=1,
                     )
             results[model_type] = latencies
             # Print results
@@ -347,7 +431,7 @@ def main():
 
             plt.xlabel('Sequence Length')
             plt.ylabel('Latency (ms)')
-            plt.title('Mean Inference Latency vs Sequence Length')
+            plt.title('Mean Inference Latency vs Sequence Length (Prefill)')
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.yscale('log')
@@ -362,7 +446,7 @@ def main():
 
             plt.xlabel('Sequence Length')
             plt.ylabel('Throughput (samples/sec)')
-            plt.title(f'Inference Throughput vs Sequence Length (Batch={fixed_batch})')
+            plt.title(f'Inference Throughput vs Sequence Length (Prefill, Batch={fixed_batch})')
             plt.legend()
             plt.grid(True, alpha=0.3)
 
@@ -375,7 +459,7 @@ def main():
 
             plt.xlabel('Sequence Length')
             plt.ylabel('Latency per Sample (ms)')
-            plt.title(f'Latency per Sample vs Sequence Length (Batch={args.batch_sizes[0]})')
+            plt.title(f'Latency per Sample vs Sequence Length (Prefill, Batch={args.batch_sizes[0]})')
             plt.legend()
             plt.grid(True, alpha=0.3)
 
@@ -395,7 +479,7 @@ def main():
 
             bars = plt.bar(model_names, mean_latencies, yerr=std_latencies, capsize=5, alpha=0.7)
             plt.ylabel('Latency (ms)')
-            plt.title(f'Model Comparison (Seq Len = {comparison_seq_len})')
+            plt.title(f'Model Comparison (Prefill, Seq Len = {comparison_seq_len})')
             plt.grid(True, alpha=0.3, axis='y')
 
             for bar, mean_lat, std_lat in zip(bars, mean_latencies, std_latencies):
@@ -412,7 +496,7 @@ def main():
 
             plt.xlabel('Batch Size')
             plt.ylabel('Latency (ms)')
-            plt.title('Mean Inference Latency vs Batch Size')
+            plt.title(f'Mean Inference Latency vs Batch Size (Decode, cache={args.decode_cache_len})')
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.yscale('log')
@@ -425,7 +509,7 @@ def main():
 
             plt.xlabel('Batch Size')
             plt.ylabel('Throughput (samples/sec)')
-            plt.title('Inference Throughput vs Batch Size')
+            plt.title(f'Inference Throughput vs Batch Size (Decode, cache={args.decode_cache_len})')
             plt.legend()
             plt.grid(True, alpha=0.3)
 
@@ -437,7 +521,7 @@ def main():
 
             plt.xlabel('Batch Size')
             plt.ylabel('Latency per Sample (ms)')
-            plt.title('Latency per Sample vs Batch Size')
+            plt.title(f'Latency per Sample vs Batch Size (Decode, cache={args.decode_cache_len})')
             plt.legend()
             plt.grid(True, alpha=0.3)
 
@@ -455,7 +539,7 @@ def main():
 
             bars = plt.bar(model_names, mean_latencies, yerr=std_latencies, capsize=5, alpha=0.7)
             plt.ylabel('Latency (ms)')
-            plt.title(f'Model Comparison (Batch Size = {comparison_batch_size})')
+            plt.title(f'Model Comparison (Decode, Batch={comparison_batch_size}, cache={args.decode_cache_len})')
             plt.grid(True, alpha=0.3, axis='y')
 
             for bar, mean_lat, std_lat in zip(bars, mean_latencies, std_latencies):

@@ -37,6 +37,8 @@ class MambaConfig:
     d_state: int = 16 # N in paper/comments
     expand_factor: int = 2 # E in paper/comments
     d_conv: int = 4
+    # Decode-time cache window for Transformer step() (tokens)
+    kv_cache_len: int = 64
 
     dt_min: float = 0.001
     dt_max: float = 0.1
@@ -65,6 +67,20 @@ class LSTMBlock(nn.Module):
         out, _ = self.lstm(x)
         return out
 
+    def step(self, x, cache):
+        """One-step decode with hidden state cache.
+        x: (B, D), cache: (h, c) or None. Returns (B, D), (h, c).
+        """
+        B, D = x.shape
+        num_layers = self.config.n_layers
+        if cache is None or cache[0] is None or cache[1] is None:
+            h0 = torch.zeros(num_layers, B, D, device=x.device, dtype=x.dtype)
+            c0 = torch.zeros(num_layers, B, D, device=x.device, dtype=x.dtype)
+        else:
+            h0, c0 = cache
+        out, (hn, cn) = self.lstm(x.unsqueeze(1), (h0, c0))
+        return out.squeeze(1), (hn, cn)
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
@@ -85,6 +101,25 @@ class TransformerBlock(nn.Module):
         # Minimal memory to satisfy API; no encoder context in decoder-only models
         memory = torch.zeros(B, 1, D, device=x.device, dtype=x.dtype)
         return self.decoder(x, memory, tgt_mask=tgt_mask)
+
+    def step(self, x, cache):
+        """Sliding-window decode step for transformer.
+        x: (B, D) current normalized token. cache: (B, <=kv_cache_len-1, D) or None.
+        Returns y: (B, D) and updated cache.
+        """
+        B, D = x.shape
+        window = max(1, int(getattr(self.config, 'kv_cache_len', 64)))
+        if cache is None:
+            cache = x.new_zeros(B, 0, D)
+        seq_in = torch.cat([cache, x.unsqueeze(1)], dim=1)
+        if seq_in.size(1) > window:
+            seq_in = seq_in[:, -window:, :]
+        out_seq = self.forward(seq_in)
+        y = out_seq[:, -1, :]
+        # Keep last window-1 tokens as cache (normalized inputs)
+        keep = min(window - 1, seq_in.size(1))
+        new_cache = seq_in[:, -keep:, :] if keep > 0 else seq_in.new_zeros(B, 0, D)
+        return y, new_cache
 
 def create_sequence_block(config: MambaConfig):
     if config.model_type == 'mamba':
