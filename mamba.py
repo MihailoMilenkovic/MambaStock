@@ -31,10 +31,14 @@ See Figure 3 of the paper (page 8) for a visual representation of a MambaBlock.
 class MambaConfig:
     d_model: int # D
     n_layers: int
+    model_type: str = 'mamba'  # 'mamba', 'lstm', or 'transformer'
+    n_heads: int = 1  # number of attention heads for transformer
     dt_rank: Union[int, str] = 'auto'
     d_state: int = 16 # N in paper/comments
     expand_factor: int = 2 # E in paper/comments
     d_conv: int = 4
+    # Decode-time cache window for Transformer step() (tokens)
+    kv_cache_len: int = 64
 
     dt_min: float = 0.001
     dt_max: float = 0.1
@@ -53,7 +57,81 @@ class MambaConfig:
         if self.dt_rank == 'auto':
             self.dt_rank = math.ceil(self.d_model / 16)
 
-class Mamba(nn.Module):
+class LSTMBlock(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        self.lstm = nn.LSTM(config.d_model, config.d_model, config.n_layers, batch_first=True)
+        
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return out
+
+    def step(self, x, cache):
+        """One-step decode with hidden state cache.
+        x: (B, D), cache: (h, c) or None. Returns (B, D), (h, c).
+        """
+        B, D = x.shape
+        num_layers = self.config.n_layers
+        if cache is None or cache[0] is None or cache[1] is None:
+            h0 = torch.zeros(num_layers, B, D, device=x.device, dtype=x.dtype)
+            c0 = torch.zeros(num_layers, B, D, device=x.device, dtype=x.dtype)
+        else:
+            h0, c0 = cache
+        out, (hn, cn) = self.lstm(x.unsqueeze(1), (h0, c0))
+        return out.squeeze(1), (hn, cn)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config: MambaConfig):
+        super().__init__()
+        self.config = config
+        # Decoder-only stack with causal self-attention
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.d_model,
+            nhead=config.n_heads,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, config.n_layers)
+
+    def forward(self, x):
+        # x: (B, L, D)
+        B, L, D = x.shape
+        # Causal mask for autoregressive decoding (allow attend to <= current position)
+        tgt_mask = torch.triu(torch.full((L, L), float('-inf'), device=x.device), diagonal=1)
+        # Minimal memory to satisfy API; no encoder context in decoder-only models
+        memory = torch.zeros(B, 1, D, device=x.device, dtype=x.dtype)
+        return self.decoder(x, memory, tgt_mask=tgt_mask)
+
+    def step(self, x, cache):
+        """Sliding-window decode step for transformer.
+        x: (B, D) current normalized token. cache: (B, <=kv_cache_len-1, D) or None.
+        Returns y: (B, D) and updated cache.
+        """
+        B, D = x.shape
+        window = max(1, int(getattr(self.config, 'kv_cache_len', 64)))
+        if cache is None:
+            cache = x.new_zeros(B, 0, D)
+        seq_in = torch.cat([cache, x.unsqueeze(1)], dim=1)
+        if seq_in.size(1) > window:
+            seq_in = seq_in[:, -window:, :]
+        out_seq = self.forward(seq_in)
+        y = out_seq[:, -1, :]
+        # Keep last window-1 tokens as cache (normalized inputs)
+        keep = min(window - 1, seq_in.size(1))
+        new_cache = seq_in[:, -keep:, :] if keep > 0 else seq_in.new_zeros(B, 0, D)
+        return y, new_cache
+
+def create_sequence_block(config: MambaConfig):
+    if config.model_type == 'mamba':
+        return MambaBlock(config)
+    elif config.model_type == 'lstm':
+        return LSTMBlock(config)
+    elif config.model_type == 'transformer':
+        return TransformerBlock(config)
+    else:
+        raise ValueError(f"Unsupported model_type: {config.model_type}")
+
+class Model(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
 
@@ -90,7 +168,7 @@ class ResidualBlock(nn.Module):
     def __init__(self, config: MambaConfig):
         super().__init__()
 
-        self.mixer = MambaBlock(config)
+        self.mixer = create_sequence_block(config)
         self.norm = RMSNorm(config.d_model)
 
     def forward(self, x):
@@ -110,7 +188,11 @@ class ResidualBlock(nn.Module):
         # output : (B, D)
         # cache : (h, inputs)
 
-        output, cache = self.mixer.step(self.norm(x), cache)
+        if hasattr(self.mixer, 'step'):
+            output, cache = self.mixer.step(self.norm(x), cache)
+        else:
+            # For LSTM and Transformer blocks, just use forward pass
+            output = self.mixer(self.norm(x.unsqueeze(0))).squeeze(0)
         output = output + x
         return output, cache
 

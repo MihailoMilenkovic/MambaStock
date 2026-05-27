@@ -21,6 +21,8 @@ The stock data used in this repository was downloaded from [TuShare](https://tus
 python main.py
 ```
 
+- GPU usage: training auto-detects CUDA if available; no flag is needed. The old `--use-cuda` flag is deprecated and ignored.
+
 ## Options
 
 We adopt an argument parser by package  `argparse` in Python, and the options for running code are defined as follow:
@@ -28,7 +30,7 @@ We adopt an argument parser by package  `argparse` in Python, and the options fo
 ```python
 parser = argparse.ArgumentParser()
 parser.add_argument('--use-cuda', default=False,
-                    help='CUDA training.')
+                    help='[Deprecated] CUDA is auto-detected; flag ignored.')
 parser.add_argument('--seed', type=int, default=1, help='Random seed.')
 parser.add_argument('--epochs', type=int, default=100,
                     help='Number of epochs to train.')

@@ -5,12 +5,12 @@ from sklearn.metrics import mean_squared_error,mean_absolute_error,r2_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba import Mamba, MambaConfig
+from mamba import Model, MambaConfig
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--use-cuda', default=False,
-                    help='CUDA training.')
+parser.add_argument('--use-cuda', action="store_true",
+                    help='[Deprecated] CUDA auto-detected; flag ignored')
 parser.add_argument('--seed', type=int, default=1, help='Random seed.')
 parser.add_argument('--epochs', type=int, default=100,
                     help='Number of epochs to train.')
@@ -25,10 +25,16 @@ parser.add_argument('--layer', type=int, default=2,
 parser.add_argument('--n-test', type=int, default=300,
                     help='Size of test set')
 parser.add_argument('--ts-code', type=str, default='601988',
-                    help='Stock code')                    
+                    help='Stock code')
+parser.add_argument('--model_type', type=str, default='mamba', 
+                    choices=['mamba', 'lstm', 'transformer'],
+                    help='Model type: mamba, lstm, or transformer')
 
 args = parser.parse_args()
-args.cuda = args.use_cuda and torch.cuda.is_available()
+# Auto-select device (CUDA if available, else CPU). Keep args.cuda for backward compatibility.
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+args.cuda = (device.type == 'cuda')
+print(f"Training device: {device}")
 
 def evaluation_metric(y_test,y_hat):
     MSE = mean_squared_error(y_test, y_hat)
@@ -40,8 +46,8 @@ def evaluation_metric(y_test,y_hat):
 def set_seed(seed,cuda):
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if cuda:
-        torch.cuda.manual_seed(seed)
+    if cuda and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def dateinf(series, n_test):
     lt = len(series)
@@ -55,29 +61,25 @@ set_seed(args.seed,args.cuda)
 class Net(nn.Module):
     def __init__(self,in_dim,out_dim):
         super().__init__()
-        self.config = MambaConfig(d_model=args.hidden, n_layers=args.layer)
-        self.mamba = nn.Sequential(
+        
+        self.config = MambaConfig(d_model=args.hidden, n_layers=args.layer, model_type=args.model_type)
+        self.model = nn.Sequential(
             nn.Linear(in_dim,args.hidden),
-            Mamba(self.config),
+            Model(self.config),
             nn.Linear(args.hidden,out_dim),
             nn.Tanh()
         )
     
     def forward(self,x):
-        x = self.mamba(x)
+        x = self.model(x)
         return x.flatten()
 
-def PredictWithData(trainX, trainy, testX):
-    clf = Net(len(trainX[0]),1)
-    opt = torch.optim.Adam(clf.parameters(),lr=args.lr,weight_decay=args.wd)
-    xt = torch.from_numpy(trainX).float().unsqueeze(0)
-    xv = torch.from_numpy(testX).float().unsqueeze(0)
-    yt = torch.from_numpy(trainy).float()
-    if args.cuda:
-        clf = clf.cuda()
-        xt = xt.cuda()
-        xv = xv.cuda()
-        yt = yt.cuda()
+def PredictWithData(trainX, trainy, testX, device):
+    clf = Net(len(trainX[0]),1).to(device)
+    opt = torch.optim.Adam(clf.parameters(), lr=args.lr, weight_decay=args.wd)
+    xt = torch.from_numpy(trainX).float().unsqueeze(0).to(device)
+    xv = torch.from_numpy(testX).float().unsqueeze(0).to(device)
+    yt = torch.from_numpy(trainy).float().to(device)
     
     for e in range(args.epochs):
         clf.train()
@@ -91,9 +93,8 @@ def PredictWithData(trainX, trainy, testX):
 
     clf.eval()
     mat = clf(xv)
-    if args.cuda: mat = mat.cpu()
-    yhat = mat.detach().numpy().flatten()
-    return yhat
+    yhat = mat.detach().cpu().numpy().flatten()
+    return yhat, clf
 
 data = pd.read_csv(args.ts_code+'.SH.csv')
 data['trade_date'] = pd.to_datetime(data['trade_date'], format='%Y%m%d')
@@ -103,7 +104,7 @@ data.drop(columns=['pre_close','change','pct_chg'],inplace=True)
 dat = data.iloc[:,2:].values
 trainX, testX = dat[:-args.n_test, :], dat[-args.n_test:, :]
 trainy = ratechg[:-args.n_test]
-predictions = PredictWithData(trainX, trainy, testX)
+predictions, model = PredictWithData(trainX, trainy, testX, device)
 time = data['trade_date'][-args.n_test:]
 data1 = close[-args.n_test:]
 finalpredicted_stock_price = []
@@ -115,10 +116,25 @@ for i in range(args.n_test):
 dateinf(data['trade_date'],args.n_test)
 print('MSE RMSE MAE R2')
 evaluation_metric(data1, finalpredicted_stock_price)
+
+# Save model
+model_save_path = f'model_{args.model_type}_{args.ts_code}.pth'
+model_info = {
+    'state_dict': model.state_dict(),
+    'config': {
+        'model_type': args.model_type,
+        'hidden': args.hidden,
+        'layer': args.layer,
+        'input_dim': len(trainX[0])
+    },
+    'args': vars(args)
+}
+torch.save(model_info, model_save_path)
+print(f'Model saved to {model_save_path}')
 plt.figure(figsize=(10, 6))
 plt.plot(time, data1, label='Stock Price')
 plt.plot(time, finalpredicted_stock_price, label='Predicted Stock Price')
-plt.title('Stock Price Prediction')
+plt.title(f'Stock Price Prediction (device: {device})')
 plt.xlabel('Time', fontsize=12, verticalalignment='top')
 plt.ylabel('Close', fontsize=14, horizontalalignment='center')
 plt.legend()
